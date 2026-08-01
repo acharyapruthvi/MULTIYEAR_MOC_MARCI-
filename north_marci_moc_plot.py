@@ -5,6 +5,8 @@ import numpy as np
 import glob
 import re
 import os
+from matplotlib import colormaps
+
 
 # ==========================Functions==========================
 def obs_prefix(path):
@@ -94,23 +96,12 @@ def ls_tick_label(x, _pos=None):
     """Turn a wrapped axis coordinate back into a true Ls label."""
     return f"{x % 360:g}"
 
-def report_outside_window(df, label):
-    """Warn about rows that wrap outside the plotted Ls window."""
-    lo = LS_WINDOW_START
-    hi = LS_WINDOW_START + LS_WINDOW_SPAN
-    out = df[(df["Wrapped_Ls"] < lo) | (df["Wrapped_Ls"] > hi)]
-    if len(out):
-        bins = sorted(out["Ls"].dropna().unique())
-        print(f"  [note] {label}: {len(out)} row(s) fall outside the "
-              f"Ls {lo:g}-{hi % 360:g} window and will not be drawn "
-              f"(true Ls: {bins})")
-
 # ── Climatological average (binned mean across all MYs) ───────────────────────
-def climatological_average(data, bin_width=5.0,
+def moving_average(data, bin_width=5.0,
                             lo=None, hi=None):
     """
     Bin Wrapped_Ls into fixed bin_width-degree bins running from lo to hi
-    and compute the mean avg_major_latitude per bin.
+    and compute the mean `avg_major_latitude` per bin.
     """
     data = data.copy()
     n_bins = int(round((hi - lo) / bin_width))
@@ -119,6 +110,42 @@ def climatological_average(data, bin_width=5.0,
     clim_lat = data.groupby("Ls_bin", observed=True)["avg_major_latitude"].mean()
     bin_centers = np.array([iv.mid for iv in clim_lat.index])
     return bin_centers, clim_lat.values
+
+# ── Two-sigma outlier filter ───────────────────────────────────────────────
+def two_sigma_filter(data, value_col="avg_major_latitude", bin_width=5.0,
+                      lo=None, hi=None, n_sigma=2.0, label=""):
+    """
+    Drop rows whose `value_col` is more than `n_sigma` standard deviations
+    from the mean of its own Wrapped_Ls bin (same binning used by
+    climatological_average, so the filter and the average line line up).
+
+    Bins with fewer than 3 points don't have a meaningful std, so points in
+    those bins are kept as-is rather than discarded.
+    """
+    if lo is None:
+        lo = LS_WINDOW_START
+    if hi is None:
+        hi = LS_WINDOW_START + LS_WINDOW_SPAN
+
+    data = data.copy()
+    n_bins = int(round((hi - lo) / bin_width))
+    bins = np.linspace(lo, hi, n_bins + 1)
+    data["Ls_bin"] = pd.cut(data["Wrapped_Ls"], bins=bins)
+
+    grp = data.groupby("Ls_bin", observed=True)[value_col]
+    bin_mean = grp.transform("mean")
+    bin_std = grp.transform("std")
+    bin_count = grp.transform("count")
+
+    within_sigma = (data[value_col] - bin_mean).abs() <= n_sigma * bin_std
+    keep = within_sigma | (bin_count < 3)  # can't reliably filter tiny bins
+
+    n_removed = int((~keep).sum())
+    if n_removed:
+        tag = f" ({label})" if label else ""
+        print(f"  [two-sigma filter]{tag} removed {n_removed} of {len(data)} points")
+
+    return data.loc[keep].drop(columns="Ls_bin")
 
 # ==========================Variables==========================
 # --------------------------------------------------------------------------
@@ -139,6 +166,7 @@ LS_WINDOW_START = 340.0
 LS_WINDOW_SPAN  = 90.0
 LS_TICK_STEP    = 10.0
 MY_BIN_WIDTH = 5.0  # degrees per bin for the per-MY Ls average
+SIGMA_N = 2.0        # how many standard deviations to keep
 
 polar_north_base_dir = "polar_north"
 polar_south_base_dir = "polar_south"
@@ -169,35 +197,41 @@ marci_north_dataframe['avg_major_latitude'] = marci_north_dataframe[['major_end1
 moc_north_dataframe["Wrapped_Ls"] = wrap_ls(moc_north_dataframe["Ls"])
 marci_north_dataframe["Wrapped_Ls"] = wrap_ls(marci_north_dataframe["Ls"])
 
-report_outside_window(moc_north_dataframe, "MOC north")
-report_outside_window(marci_north_dataframe, "MARCI north")
+# Making a new dataframe with only the required columns for plotting
+moc_subset = moc_north_dataframe[['Wrapped_Ls', 'avg_major_latitude', 'MY']].copy()
+moc_subset['instrument'] = 'MOC'
 
+marci_subset = marci_north_dataframe[['Wrapped_Ls', 'avg_major_latitude', 'MY']].copy()
+marci_subset['instrument'] = 'MARCI'
 
+# Stack them into one dataframe
+new_df = pd.concat([moc_subset, marci_subset], ignore_index=True)
+new_df = new_df.sort_values('MY').reset_index(drop=True)
+print(new_df.head())
 # ==========================Plotting==========================
-fig, ax = plt.subplots(figsize=(9, 5))
+fig, ax = plt.subplots()
 
-for my_val, group in moc_north_dataframe.groupby('MY'):
-    sc = ax.scatter(group['Wrapped_Ls'], group['avg_major_latitude'],
-                    label=f'MOC MY {my_val}', s=5)
-    ls_avg, lat_avg = climatological_average(
-        group, bin_width=MY_BIN_WIDTH,
-        lo=LS_WINDOW_START, hi=LS_WINDOW_START + LS_WINDOW_SPAN)
-    ax.plot(ls_avg, lat_avg, color=sc.get_facecolor()[0], linewidth=1)
-for my_val, group in marci_north_dataframe.groupby('MY'):
-    sc = ax.scatter(group['Wrapped_Ls'], group['avg_major_latitude'],
-                    label=f'MARCI MY {my_val}', s=5)
-    ls_avg, lat_avg = climatological_average(
-        group, bin_width=MY_BIN_WIDTH,
-        lo=LS_WINDOW_START, hi=LS_WINDOW_START + LS_WINDOW_SPAN)
-    ax.plot(ls_avg, lat_avg, color=sc.get_facecolor()[0], linewidth=1)
-ax.set_xlim(LS_WINDOW_START, LS_WINDOW_START + LS_WINDOW_SPAN)
-ax.set_xticks(np.arange(LS_WINDOW_START,
-                        LS_WINDOW_START + LS_WINDOW_SPAN + 0.5,
-                        LS_TICK_STEP))
+for my_val, group in new_df.groupby('MY'):
+    for instrument, sub_group in group.groupby('instrument'):
+        group_f = two_sigma_filter(
+            sub_group, bin_width=MY_BIN_WIDTH,
+            lo=LS_WINDOW_START, hi=LS_WINDOW_START + LS_WINDOW_SPAN,
+            n_sigma=SIGMA_N, label=f"{instrument} MY {my_val}")
+        sc = ax.scatter(group_f['Wrapped_Ls'], group_f['avg_major_latitude'],
+                        label=f'{instrument} MY {my_val}', s=5)
+        ls_avg, lat_avg = moving_average(
+            group_f, bin_width=MY_BIN_WIDTH,
+            lo=LS_WINDOW_START, hi=LS_WINDOW_START + LS_WINDOW_SPAN)
+        ax.plot(ls_avg, lat_avg, color=sc.get_facecolor()[0], linewidth=1)
+# Plotting the climatological average line
+clim_ls, clim_lat = moving_average(
+    new_df, bin_width=MY_BIN_WIDTH,
+    lo=LS_WINDOW_START, hi=LS_WINDOW_START + LS_WINDOW_SPAN)
+ax.plot(clim_ls, clim_lat, color='black', linewidth=2, label='Climatological average')
 ax.xaxis.set_major_formatter(FuncFormatter(ls_tick_label))
 ax.set_xlabel('Ls (deg)')
 ax.set_ylabel('Avg Major Latitude')
 ax.legend(title='Mars Year')
-ax.set_title('North polar cap - MOC vs MARCI')
+ax.set_title('North polar cap - MOC vs MARCI (2 sigma filtered)')
 
 plt.show()
